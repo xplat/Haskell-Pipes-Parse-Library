@@ -104,16 +104,17 @@ module Pipes.Parse (
     module Control.Monad.Trans.State.Strict
     ) where
 
-import Control.Monad (liftM, unless)
+import Control.Monad (forever, liftM, unless, void)
 import qualified Control.Monad.Trans.Free as F
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Free (FreeF(Pure, Free), FreeT(FreeT, runFreeT))
+import Control.Monad.Trans.Free (FreeF(Free), FreeT(FreeT, runFreeT))
 import qualified Control.Monad.Trans.State.Strict as S
 import Control.Monad.Trans.State.Strict (
     StateT(StateT, runStateT), evalStateT, execStateT )
 import Data.Maybe (isNothing)
-import Pipes (Producer, Pipe, await, yield, next, (>->))
+import Pipes (Producer, Pipe, Consumer, await, yield, next, (>->), run)
 import Pipes.Core (Producer')
+import Pipes.Internal (Proxy(..))
 import Pipes.Lift (runStateP, execStateP)
 import qualified Pipes.Prelude as P
 import Prelude hiding (concat, takeWhile)
@@ -123,46 +124,103 @@ import Prelude hiding (concat, takeWhile)
 -}
 groupBy
     :: (Monad m)
-    => (a -> a -> Bool) -> Producer a m () -> FreeT (Producer a m) m ()
-groupBy equal = loop
+    => (a -> a -> Bool) -> FreeT (Pipe a a m) (Consumer a m) r
+groupBy equal = lift await >>= loop
   where
-    loop p = do
-        x <- lift (next p)
-        case x of
-            Left  r       -> return r
-            Right (a, p1) -> do
-                p2 <- F.liftF $ execStateP p1 $ do
-                    yield a
-                    input >-> takeWhile (equal a)
-                loop p2
+    loop a = do
+        x <- F.liftF $ do
+            yield a
+            takeWhile' (equal a)
+        loop x
 {-# INLINABLE groupBy #-}
 
 {-| Split a 'Producer' into a `FreeT`-delimited stream of 'Producer's of the
     given chunk size
 -}
-chunksOf :: (Monad m) => Int -> Producer a m () -> FreeT (Producer a m) m () 
-chunksOf n = loop
+chunksOf :: (Monad m) => Int -> FreeT (Pipe a a m) (Consumer a m) () 
+-- chunksOf n = forever $ F.liftF $ P.take n
+-- can't be that easy if you don't want an empty last chunk :(
+chunksOf 0 = forever $ F.liftF $ return ()
+chunksOf n = forever $ do
+    x <- lift await
+    F.liftF $ do
+        yield x
+        P.take m
   where
-    loop p = do
-        (eof, p') <- F.liftF $ runStateP p $ do
-            input >-> P.take n
-            lift isEndOfInput
-        unless eof (loop p')
+    m = n - 1
 {-# INLINABLE chunksOf #-}
 
 {-| Split a 'Producer' into a `FreeT`-delimited stream of 'Producer's separated
     by elements that satisfy the given predicate
 -}
 splitOn
-    :: (Monad m) => (a -> Bool) -> Producer a m () -> FreeT (Producer a m) m ()
+    :: (Monad m) => (a -> Bool) -> FreeT (Pipe a a m) (Consumer a m) ()
 splitOn predicate = loop
   where
-    loop p = do
-        (stop, p') <- F.liftF $ runStateP p $ do
-            input >-> takeWhile (not . predicate)
-            lift $ liftM isNothing draw
-        unless stop (loop p')
+    loop = forever $ F.liftF $ P.takeWhile (not . predicate)
 {-# INLINABLE splitOn #-}
+
+{-| (p >>~* fl) pairs each 'respond' in @p@ with a 'request' in @fl@.
+ -}
+(>>~*)
+    :: (Monad m)
+    =>       Proxy a' a b' b m r
+    -> (b -> FreeT (Proxy b' b c' c m) (Proxy b' b d' d m) r)
+    ->       FreeT (Proxy a' a c' c m) (Proxy a' a d' d m) r
+p >>~* flb = case p of
+    Request a' fa  -> FreeT (Request a' (\a -> runFreeT (fa a >>~* flb)))
+    Respond b  fb' -> fb' +>>* flb b
+    M          m   -> FreeT (M (m >>= \p' -> return (runFreeT (p' >>~* flb))))
+    Pure       r   -> FreeT (Pure (F.Pure r))
+{-# INLINABLE (>>~*) #-}
+
+(>>~?)
+    :: (Monad m)
+    =>       Proxy a' a b' b m r
+    -> (b -> Proxy b' b c' c m (FreeT (Proxy b' b d' d m) (Proxy b' b e' e m) r))
+    ->       Proxy a' a c' c m (FreeT (Proxy a' a d' d m) (Proxy a' a e' e m) r)
+p >>~? fplb = case p of
+    Request a' fa  -> Request a' (\a -> fa a >>~? fplb)
+    Respond b  fb' -> fb' +>>? fplb b
+    M          m   -> M (m >>= \p' -> return (p' >>~? fplb))
+    Pure       r   -> Pure (FreeT (Pure (F.Pure r)))
+{-# INLINABLE (>>~?) #-}
+
+{-| (f +>>* lp) pairs each 'request' in @lp@ with a 'respond' in @f@.
+ -}
+(+>>*)
+    :: (Monad m)
+    => (b' -> Proxy a' a b' b m r)
+    -> FreeT (Proxy b' b c' c m) (Proxy b' b d' d m) r
+    -> FreeT (Proxy a' a c' c m) (Proxy a' a d' d m) r
+fb' +>>* lp = case runFreeT lp of
+    Request b'  fb  -> fb' b' >>~* (\b -> FreeT (fb b))
+    Respond c   fc' -> FreeT (Respond c (\c' -> runFreeT (fb' +>>* FreeT (fc' c'))))
+    M           m   -> FreeT (M (m >>= \lp' -> return (runFreeT (fb' +>>* FreeT lp'))))
+    Pure        s   -> case s of
+        F.Pure  r   -> FreeT (Pure (F.Pure r))
+        Free    f   -> FreeT (Pure (Free (fb' +>>? f)))
+{-# INLINABLE (+>>*) #-}
+
+(+>>?)
+    :: (Monad m)
+    => (b' -> Proxy a' a b' b m r)
+    -> Proxy b' b c' c m (FreeT (Proxy b' b d' d m) (Proxy b' b e' e m) r)
+    -> Proxy a' a c' c m (FreeT (Proxy a' a d' d m) (Proxy a' a e' e m) r)
+fb' +>>? plp = case plp of
+    Request b'  fb  -> fb' b' >>~? fb
+    Respond c   fc' -> Respond c (\c' -> (fb' +>>? fc' c'))
+    M           m   -> M (m >>= \plp' -> return (fb' +>>? plp'))
+    Pure        lp  -> Pure (fb' +>>* lp)
+{-# INLINABLE (+>>?) #-}
+
+(>->*)
+    :: (Monad m)
+    => Proxy a' a () b m r
+    -> FreeT (Proxy () b c' c m) (Proxy () b d' d m) r
+    -> FreeT (Proxy a' a c' c m) (Proxy a' a d' d m) r
+p >->* lp = (\() -> p) +>>* lp
+{-# INLINABLE (>->*) #-}
 
 -- | Join a 'FreeT'-delimited stream of 'Producer's into a single 'Producer'
 concat :: (Monad m) => FreeT (Producer a m) m () -> Producer a m ()
@@ -171,8 +229,8 @@ concat = loop
     loop f = do
         x <- lift (runFreeT f)
         case x of
-            Pure r -> return r
-            Free p -> do
+            F.Pure r -> return r
+            Free   p -> do
                 f' <- p
                 concat f'
 {-# INLINABLE concat #-}
@@ -188,15 +246,15 @@ intercalate sep = go0
     go0 f = do
         x <- lift (runFreeT f)
         case x of
-            Pure r -> return r
-            Free p -> do
+            F.Pure r -> return r
+            Free   p -> do
                 f' <- p
                 go1 f'
     go1 f = do
         x <- lift (runFreeT f)
         case x of
-            Pure r -> return r
-            Free p -> do
+            F.Pure r -> return r
+            Free   p -> do
                 sep
                 f' <- p
                 go1 f'
@@ -204,17 +262,24 @@ intercalate sep = go0
 
 -- | @(take n)@ only keeps the first @n@ functor layers of a 'FreeT'
 takeFree :: (Functor f, Monad m) => Int -> FreeT f m r -> FreeT f m ()
-takeFree = go
+takeFree n = void . splitAtFree n
+{-# INLINABLE takeFree #-}
+
+splitAtFree :: (Functor f, Monad m) => Int -> FreeT f m r -> FreeT f m (FreeT f m r)
+splitAtFree = go
   where
     go n f =
         if (n > 0)
         then FreeT $ do
             x <- runFreeT f
             case x of
-                Pure _ -> return (Pure ())
-                Free w -> return (Free (fmap (go $! n - 1) w))
-        else return ()
-{-# INLINABLE takeFree #-}
+                F.Pure r -> return (F.Pure (return r))
+                Free   w -> return (Free   (fmap (go $! n - 1) w))
+        else return f
+{-# INLINABLE splitAtFree #-}
+
+test1 :: IO ()
+test1 = run $ concat (takeFree 3 (F.hoistFreeT run (P.stdin >->* groupBy (==)))) >-> P.stdout
 
 {- $lowlevel
     @pipes-parse@ handles end-of-input and pushback by storing a 'Producer' in
@@ -316,12 +381,13 @@ input = loop
                 loop
 {-# INLINABLE input #-}
 
-{-| A variation on 'Pipes.Prelude.takeWhile' from @Pipes.Prelude@ that 'unDraw's
+{-| A variation on 'Pipes.Prelude.takeWhile' from @Pipes.Prelude@ that 'return's
     the first element that does not match
 -}
-takeWhile
-    :: (Monad m) => (a -> Bool) -> Pipe a a (StateT (Producer a m r) m) ()
-takeWhile predicate = loop
+
+takeWhile'
+    :: (Monad m) => (a -> Bool) -> Pipe a a m a
+takeWhile' predicate = loop
   where
     loop = do
         a <- await
@@ -329,7 +395,14 @@ takeWhile predicate = loop
             then do
                 yield a
                 loop
-            else lift (unDraw a)
+            else return a
+
+{-| A variation on 'Pipes.Prelude.takeWhile' from @Pipes.Prelude@ that 'unDraw's
+    the first element that does not match
+-}
+takeWhile
+    :: (Monad m) => (a -> Bool) -> Pipe a a (StateT (Producer a m r) m) ()
+takeWhile predicate = takeWhile' predicate >>= lift . unDraw
 {-# INLINABLE takeWhile #-}
 
 {- $reexports
